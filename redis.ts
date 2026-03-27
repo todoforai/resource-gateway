@@ -21,10 +21,21 @@ export async function getRedis(): Promise<RedisClientType> {
   return client;
 }
 
-/** Look up userId from an API key. Returns null if not found. */
-export async function getUserIdFromApiKey(key: string): Promise<string | null> {
+/**
+ * Look up userId from a token. Checks in order:
+ *   1. Short-lived resource token (resource:token:xxx → userId, auto-expires)
+ *   2. API key (apikey:xxx → { userId })
+ * Returns null if not found.
+ */
+export async function getUserIdFromApiKey(token: string): Promise<string | null> {
   const redis = await getRedis();
-  const data = await redis.hGetAll(`apikey:${key}`);
+
+  // 1. Check for short-lived resource token (issued by backend for browser sessions)
+  const resourceUserId = await redis.get(`resource:token:${token}`);
+  if (resourceUserId) return resourceUserId;
+
+  // 2. Check for API key
+  const data = await redis.hGetAll(`apikey:${token}`);
   return data?.userId ?? null;
 }
 

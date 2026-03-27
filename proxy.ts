@@ -98,10 +98,25 @@ export class ResourceProxy {
 }
 
 function extractToken(req: IncomingMessage): string | null {
+  // 1. Authorization header (Bearer token)
   const auth = req.headers['authorization'];
   if (auth?.startsWith('Bearer ')) return auth.slice(7);
-  // x-api-key header
+
+  // 2. x-api-key header
   const apiKey = req.headers['x-api-key'];
   if (apiKey) return Array.isArray(apiKey) ? apiKey[0] : apiKey;
+
+  // 3. URL query param (for browser WebSocket which can't set headers)
+  const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+  const tokenParam = url.searchParams.get('token');
+  if (tokenParam) return tokenParam;
+
+  // 4. Cookie (for same-domain browser clients)
+  const cookies = req.headers.cookie;
+  if (cookies) {
+    const match = cookies.match(/(?:^|;\s*)session=([^;]+)/);
+    if (match) return match[1];
+  }
+
   return null;
 }
