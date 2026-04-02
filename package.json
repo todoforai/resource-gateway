@@ -1,7 +1,7 @@
 {
-  "name": "resource-proxy",
+  "name": "resource-gateway",
   "version": "1.0.0",
-  "description": "Minimal auth+meter WebSocket proxy for browser.todofor.ai, vm.todofor.ai, etc.",
+  "description": "Auth gateway + metering for browser, terminal, VM resources",
   "type": "module",
   "main": "server.ts",
   "scripts": {
@@ -9,8 +9,10 @@
     "start": "bun server.ts"
   },
   "dependencies": {
+    "@trpc/server": "^11.8.1",
     "redis": "^4.6.13",
-    "ws": "^8.16.0"
+    "ws": "^8.16.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/ws": "^8.5.10",

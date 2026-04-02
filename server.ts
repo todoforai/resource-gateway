@@ -1,17 +1,17 @@
 /**
- * resource-proxy server
+ * resource-gateway
  *
- * Auth gateway + session management for browser resources.
+ * Auth gateway + metering for browser, terminal, VM resources.
  *
- * HTTP API:
- *   POST   /browser/sessions          Create session
- *   GET    /browser/sessions          List my sessions  
- *   GET    /browser/sessions/:id      Get session details
- *   DELETE /browser/sessions/:id      Close session
- *   DELETE /browser/sessions          Close all my sessions
+ * HTTP API (tRPC):
+ *   /trpc/browser.create     Create session
+ *   /trpc/browser.list       List my sessions
+ *   /trpc/browser.get        Get session details
+ *   /trpc/browser.delete     Close session
+ *   /trpc/browser.deleteAll  Close all my sessions
  *
  * WebSocket:
- *   /browser/:sessionId?api_key=xxx   CDP relay with billing
+ *   /browser/:sessionId?api_key=xxx   CDP relay with billing ($0.005/min)
  *
  * Auth: x-api-key header or ?api_key= query param
  * Both validate against shared Redis (apikey:* or resource:token:*)
@@ -25,43 +25,14 @@
 
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { fetchRequestHandler } from '@trpc/server/adapters/fetch';
 import { ResourceProxy } from './proxy.ts';
-import { getUserIdFromApiKey } from './redis.ts';
+import { appRouter, createContext } from './trpc.ts';
 
 const PORT = parseInt(process.env.PORT ?? '6000');
 
-const BROWSER_HTTP = process.env.BROWSER_HTTP ??
-  (process.env.NODE_ENV === 'production' ? 'http://browser:8086' : 'http://localhost:8086');
-
 const BROWSER_WS = process.env.BROWSER_WS ??
   (process.env.NODE_ENV === 'production' ? 'ws://browser:8085' : 'ws://localhost:8085');
-
-// ── Auth ──────────────────────────────────────────────────────────────────────
-
-function extractApiKey(req: IncomingMessage): string | null {
-  const auth = req.headers['authorization'];
-  if (auth?.startsWith('Bearer ')) return auth.slice(7);
-  const apiKey = req.headers['x-api-key'];
-  if (apiKey) return Array.isArray(apiKey) ? apiKey[0] : apiKey;
-  const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
-  return url.searchParams.get('api_key');
-}
-
-async function authenticate(req: IncomingMessage, res: ServerResponse): Promise<string | null> {
-  const apiKey = extractApiKey(req);
-  if (!apiKey) {
-    res.writeHead(401, jsonHeaders());
-    res.end(JSON.stringify({ error: 'Missing API key' }));
-    return null;
-  }
-  const userId = await getUserIdFromApiKey(apiKey);
-  if (!userId) {
-    res.writeHead(403, jsonHeaders());
-    res.end(JSON.stringify({ error: 'Invalid API key' }));
-    return null;
-  }
-  return userId;
-}
 
 // ── HTTP Helpers ──────────────────────────────────────────────────────────────
 
@@ -77,23 +48,23 @@ function corsHeaders() {
   };
 }
 
-async function readBody(req: IncomingMessage): Promise<any> {
+// Convert Node.js IncomingMessage to Web Request for tRPC fetch adapter
+function toWebRequest(req: IncomingMessage): Promise<Request> {
   return new Promise((resolve) => {
-    let data = '';
-    req.on('data', chunk => data += chunk);
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
-      try { resolve(JSON.parse(data || '{}')); }
-      catch { resolve({}); }
+      const body = Buffer.concat(chunks);
+      const protocol = req.headers['x-forwarded-proto'] || 'http';
+      const host = req.headers.host || 'localhost';
+      const url = `${protocol}://${host}${req.url}`;
+      resolve(new Request(url, {
+        method: req.method,
+        headers: req.headers as Record<string, string>,
+        body: ['GET', 'HEAD'].includes(req.method ?? '') ? undefined : body,
+      }));
     });
   });
-}
-
-async function browsingFetch(path: string, init?: RequestInit) {
-  const res = await fetch(`${BROWSER_HTTP}${path}`, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
-  });
-  return { ok: res.ok, status: res.status, data: await res.json().catch(() => null) };
 }
 
 // ── HTTP Handler ──────────────────────────────────────────────────────────────
@@ -116,79 +87,25 @@ async function handleHttp(req: IncomingMessage, res: ServerResponse) {
     return;
   }
 
-  // ── Browser Session API ─────────────────────────────────────────────────────
+  // ── tRPC API ────────────────────────────────────────────────────────────────
 
-  if (url.pathname.startsWith('/browser/sessions')) {
-    const userId = await authenticate(req, res);
-    if (!userId) return;
+  if (url.pathname.startsWith('/trpc')) {
+    const webReq = await toWebRequest(req);
+    const webRes = await fetchRequestHandler({
+      endpoint: '/trpc',
+      req: webReq,
+      router: appRouter,
+      createContext: () => createContext({ req, res }),
+    });
 
-    const pathParts = url.pathname.split('/');
-    const sessionId = pathParts[3]; // /browser/sessions/:id
-
-    // POST /browser/sessions — create
-    if (method === 'POST' && !sessionId) {
-      const body = await readBody(req);
-      const { ok, data } = await browsingFetch('/api/cdp-sessions', {
-        method: 'POST',
-        body: JSON.stringify({ userId, viewport: body.viewport }),
-      });
-      if (!ok) {
-        res.writeHead(500, jsonHeaders());
-        res.end(JSON.stringify({ error: 'Failed to create session' }));
-        return;
-      }
-      // Return session info with CDP URL
-      res.writeHead(201, jsonHeaders());
-      res.end(JSON.stringify({
-        ...data,
-        cdpUrl: `${req.headers.host?.includes('localhost') ? 'ws' : 'wss'}://${req.headers.host}/browser/${data.sessionId}`,
-      }));
-      return;
-    }
-
-    // GET /browser/sessions — list
-    if (method === 'GET' && !sessionId) {
-      const { data } = await browsingFetch(`/api/cdp-sessions?userId=${userId}`);
-      res.writeHead(200, jsonHeaders());
-      res.end(JSON.stringify(data ?? []));
-      return;
-    }
-
-    // GET /browser/sessions/:id — get
-    if (method === 'GET' && sessionId) {
-      const { ok, data } = await browsingFetch(`/api/cdp-sessions/${sessionId}`);
-      if (!ok || data?.userId !== userId) {
-        res.writeHead(404, jsonHeaders());
-        res.end(JSON.stringify({ error: 'Session not found' }));
-        return;
-      }
-      res.writeHead(200, jsonHeaders());
-      res.end(JSON.stringify(data));
-      return;
-    }
-
-    // DELETE /browser/sessions/:id — delete one
-    if (method === 'DELETE' && sessionId) {
-      // Verify ownership
-      const { ok, data } = await browsingFetch(`/api/cdp-sessions/${sessionId}`);
-      if (!ok || data?.userId !== userId) {
-        res.writeHead(404, jsonHeaders());
-        res.end(JSON.stringify({ error: 'Session not found' }));
-        return;
-      }
-      await browsingFetch(`/api/cdp-sessions/${sessionId}`, { method: 'DELETE' });
-      res.writeHead(200, jsonHeaders());
-      res.end(JSON.stringify({ success: true }));
-      return;
-    }
-
-    // DELETE /browser/sessions — delete all
-    if (method === 'DELETE' && !sessionId) {
-      const { data } = await browsingFetch(`/api/cdp-sessions?userId=${userId}`, { method: 'DELETE' });
-      res.writeHead(200, jsonHeaders());
-      res.end(JSON.stringify(data ?? { deleted: 0 }));
-      return;
-    }
+    // Copy response back to Node.js ServerResponse
+    res.writeHead(webRes.status, {
+      ...Object.fromEntries(webRes.headers.entries()),
+      'Access-Control-Allow-Origin': '*',
+    });
+    const body = await webRes.text();
+    res.end(body);
+    return;
   }
 
   // 404
@@ -204,32 +121,35 @@ const browserProxy = new ResourceProxy({
   costPerMinute: 0.005,
 });
 
+
 const server = createServer(handleHttp);
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
+  const url = req.url ?? '';
+
   // /browser/:sessionId (not /browser/sessions)
-  const match = req.url?.match(/^\/browser\/([^/?]+)/);
-  if (!match || match[1] === 'sessions') {
-    socket.destroy();
+  const browserMatch = url.match(/^\/browser\/([^/?]+)/);
+  if (browserMatch && browserMatch[1] !== 'sessions') {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      browserProxy.handle(ws, req, browserMatch[1]).catch((e) => {
+        console.error(`[browser] error:`, e);
+        if (ws.readyState === WebSocket.OPEN) ws.close(4500, 'Internal error');
+      });
+    });
     return;
   }
 
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    browserProxy.handle(ws, req, match[1]).catch((e) => {
-      console.error(`[proxy] error:`, e);
-      if (ws.readyState === WebSocket.OPEN) ws.close(4500, 'Internal error');
-    });
-  });
+  socket.destroy();
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 server.listen(PORT, () => {
-  console.log(`🔌 resource-proxy on :${PORT}`);
-  console.log(`   HTTP:      /browser/sessions`);
+  console.log(`🔌 resource-gateway on :${PORT}`);
+  console.log(`   tRPC:      /trpc/browser.*`);
   console.log(`   WebSocket: /browser/:sessionId`);
-  console.log(`   Upstream:  ${BROWSER_HTTP} (HTTP), ${BROWSER_WS} (WS)`);
+  console.log(`   Browser:   ${BROWSER_WS}`);
 });
 
 process.on('SIGINT', () => { server.close(); process.exit(0); });

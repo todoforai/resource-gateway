@@ -1,23 +1,45 @@
-# resource-proxy
+# resource-gateway
 
-Minimal WebSocket proxy for `browser.todofor.ai`, `vm.todofor.ai`, etc.
+Minimal auth gateway + metering proxy for browser, sandbox, and terminal resources.
 
-**~150 lines total. No framework. No shared backend code.**
+**No framework. No shared backend code.**
 
 ## What it does
 
-1. Accepts WebSocket connection on `/:resourceType/:resourceId`
-2. Verifies API key against Redis (`apikey:{key}` → `userId`)
-3. Checks balance (`appuser:{userId}.balance > 0`)
-4. Proxies to the internal upstream service
-5. Deducts `costPerMinute` every 60s, closes if balance hits 0
+1. **tRPC API** — Create/manage browser sessions and sandbox VMs
+2. **WebSocket proxy** — Relay with auth + per-minute billing
+3. **Edge token generation** — Sandbox VMs get a temporary API key so bridge inside can connect back to the backend
+
+## Supported Resources
+
+| Path | Upstream | Cost/min |
+|------|----------|----------|
+| `/browser/:sessionId` | `ws://browser:8085/cdp/:id` | $0.005 |
+| `/sandbox/:sandboxId` | `ws://sandbox-manager:9000/sandbox/:id/tty` | $0.01 |
+
+## tRPC Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `browser.create` | Create browser session |
+| `browser.list` | List user's browser sessions |
+| `browser.get` | Get browser session details |
+| `browser.delete` | Close browser session |
+| `browser.deleteAll` | Close all browser sessions |
+| `sandbox.create` | Create sandbox VM (generates edge token) |
+| `sandbox.get` | Get sandbox details |
+| `sandbox.delete` | Delete sandbox VM |
+| `sandbox.exec` | Execute command in sandbox |
+| `sandbox.pause` | Pause sandbox VM |
+| `sandbox.resume` | Resume sandbox VM |
 
 ## Files
 
 ```
-server.ts   — HTTP server + URL routing (add new resources here)
+server.ts   — HTTP server + URL routing + WebSocket upgrade
 proxy.ts    — ResourceProxy class (auth + relay + meter)
-redis.ts    — Two Redis ops: key lookup + atomic balance deduct
+redis.ts    — Redis ops: key lookup, balance deduct, edge token CRUD
+trpc.ts     — tRPC router for browser + sandbox lifecycle
 nginx.conf  — Subdomain → proxy routing
 ```
 
@@ -25,53 +47,56 @@ nginx.conf  — Subdomain → proxy routing
 
 ```bash
 DRAGONFLY_URL=redis://:password@localhost:41337 bun server.ts
+
+# With sandbox manager
+DRAGONFLY_URL=redis://... SANDBOX_MANAGER_URL=http://localhost:9000 bun server.ts
 ```
 
 ## Client usage
 
 ```typescript
-// Playwright
+// Browser (Playwright)
 const browser = await chromium.connectOverCDP(
   'wss://browser.todofor.ai/abc-session-id',
   { headers: { Authorization: 'Bearer todo_xxx' } }
 );
 
-// Puppeteer
-const browser = await puppeteer.connect({
-  browserWSEndpoint: 'wss://browser.todofor.ai/abc-session-id',
-  headers: { Authorization: 'Bearer todo_xxx' },
-});
-
-// Raw CDP
-const ws = new WebSocket('wss://browser.todofor.ai/abc-session-id', {
-  headers: { Authorization: 'Bearer todo_xxx' }
-});
+// Sandbox — create via tRPC, connect via WebSocket
+const sandbox = await trpc.sandbox.create.mutate({ template: 'alpine-edge', size: 'medium' });
+const ws = new WebSocket(sandbox.wsUrl + '?api_key=todo_xxx');
+ws.onmessage = (e) => console.log(e.data);  // PTY output
+ws.send('ls -la\n');  // PTY input
 ```
 
-## Adding a new resource type
+## Edge Token Flow (Sandbox → Backend)
 
-1. Start your service (e.g. `vm-service` on port 9000)
-2. Uncomment the `vm` entry in `server.ts`
-3. Add `vm.todofor.ai` to `nginx.conf`
-4. Done — auth + metering is inherited automatically
+```
+1. Client calls sandbox.create via tRPC
+2. resource-gateway creates temporary API key in Redis (apikey:<token>, 2h TTL)
+3. Passes edge_token to sandbox-manager → Firecracker kernel cmdline
+4. bridge inside VM reads /proc/cmdline, extracts edge.token=xxx
+5. bridge connects to wss://api.todofor.ai/ws/v2/edge-shell with Bearer token
+6. Backend validates via ApiKeyService → Redis apikey:<token> → userId
+7. Edge is registered, PTY sessions can be created
+```
 
 ## Architecture
 
 ```
-browser.todofor.ai/:sessionId
+vm.todofor.ai/:sandboxId
         │
-        │  nginx rewrite → /browser/:sessionId
+        │  nginx rewrite → /sandbox/:sandboxId
         ▼
-  resource-proxy :5000
+  resource-gateway :6000
         │
         │  1. HGETALL apikey:{token}     → userId
         │  2. HGET appuser:{userId} balance > 0?
-        │  3. ws://browser:8085/cdp/:sessionId
-        │  4. relay CDP JSON-RPC
-        │  5. every 60s: EVAL deduct $0.005
+        │  3. ws://sandbox-manager:9000/sandbox/:id/tty
+        │  4. relay PTY I/O (binary-safe)
+        │  5. every 60s: EVAL deduct $0.01
         ▼
-  browsing server :8085
+  sandbox-manager :9000
         │
         ▼
-  Chrome (CDP)
+  Firecracker VM (bridge → backend)
 ```

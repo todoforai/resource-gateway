@@ -75,3 +75,5 @@ export async function deductBalance(userId: string, amount: number): Promise<num
   }) as string[];
   return parseFloat(result[0]);
 }
+
+
